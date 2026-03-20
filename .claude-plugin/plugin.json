@@ -1,0 +1,6 @@
+{
+  "name": "transcribe-md",
+  "description": "Record and transcribe audio to markdown using whisper.cpp with Metal acceleration. Captures mic + system audio.",
+  "version": "1.0.0",
+  "license": "MIT"
+}

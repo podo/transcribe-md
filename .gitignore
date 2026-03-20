@@ -1,0 +1,15 @@
+# Swift build artifacts
+scripts/system-audio-tap/.build/
+scripts/system-audio-tap/.swiftpm/
+
+# Python
+__pycache__/
+*.pyc
+
+# macOS
+.DS_Store
+
+# Editors
+*.swp
+*.swo
+*~

@@ -1,0 +1,599 @@
+#!/usr/bin/env python3
+"""
+transcribe-to-md — Record and transcribe audio to a markdown file using whisper.cpp
+
+Records from your microphone and system audio (via ScreenCaptureKit, no
+BlackHole needed) and appends a timestamped transcript to the specified
+markdown file.
+
+Mic audio is labeled "You", system audio is labeled "Them", and both are
+interleaved by timestamp into a single transcript.
+
+First run installs ffmpeg (via Homebrew), builds whisper.cpp with Metal
+acceleration, downloads the base.en model (~150 MB), and builds a small
+Swift helper for system audio capture.
+
+Usage:
+    transcribe-to-md notes.md              Record mic + system audio
+    transcribe-to-md --mic-only notes.md   Record mic only
+    transcribe-to-md --devices             List mic devices
+    transcribe-to-md --setup               Install dependencies only
+"""
+
+import argparse
+import datetime
+import difflib
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import threading
+from pathlib import Path
+
+# ── Configuration ──────────────────────────────────────────────────────────
+
+# Resolve paths relative to this script so the skill is portable
+SCRIPT_DIR = Path(__file__).resolve().parent
+
+# Swift helper lives next to this script
+SWIFT_PROJECT = SCRIPT_DIR / "system-audio-tap"
+SYSTEM_TAP_BIN = SWIFT_PROJECT / ".build" / "release" / "system-audio-tap"
+
+# Large build artifacts (whisper.cpp, models) stay in ~/.cache
+CACHE_DIR = Path.home() / ".cache" / "transcribe-cli"
+WHISPER_DIR = CACHE_DIR / "whisper.cpp"
+MODEL_DIR = CACHE_DIR / "models"
+MODEL_PATH = MODEL_DIR / "ggml-base.en.bin"
+MODEL_URL = (
+    "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin"
+)
+DEFAULT_CHUNK = 10  # seconds
+
+# ── Globals ────────────────────────────────────────────────────────────────
+
+running = True
+whisper_bin = None
+pending_threads = []
+file_lock = threading.Lock()
+
+
+def log(msg):
+    ts = datetime.datetime.now().strftime("%H:%M:%S")
+    print(f"\033[90m[{ts}]\033[0m {msg}", file=sys.stderr, flush=True)
+
+
+# ── Dependency management ──────────────────────────────────────────────────
+
+
+def ensure_ffmpeg():
+    if shutil.which("ffmpeg"):
+        return
+    log("Installing ffmpeg via Homebrew...")
+    subprocess.run(["brew", "install", "ffmpeg"], check=True)
+    if not shutil.which("ffmpeg"):
+        sys.exit("Error: ffmpeg installation failed")
+
+
+def _find_whisper_bin():
+    for name in ("whisper-cli", "main"):
+        p = WHISPER_DIR / "build" / "bin" / name
+        if p.exists() and os.access(p, os.X_OK):
+            return p
+    return None
+
+
+def ensure_whisper():
+    global whisper_bin
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+    if not (WHISPER_DIR / "CMakeLists.txt").exists():
+        log("Cloning whisper.cpp...")
+        subprocess.run(
+            [
+                "git", "clone", "--depth", "1",
+                "https://github.com/ggerganov/whisper.cpp.git",
+                str(WHISPER_DIR),
+            ],
+            check=True,
+        )
+
+    whisper_bin = _find_whisper_bin()
+    if not whisper_bin:
+        log("Building whisper.cpp (Metal-accelerated)...")
+        if not shutil.which("cmake"):
+            log("Installing cmake via Homebrew...")
+            subprocess.run(["brew", "install", "cmake"], check=True)
+        build_dir = WHISPER_DIR / "build"
+        subprocess.run(
+            ["cmake", "-B", str(build_dir), "-DGGML_METAL=ON"],
+            cwd=str(WHISPER_DIR),
+            check=True,
+        )
+        subprocess.run(
+            ["cmake", "--build", str(build_dir), "--config", "Release", "-j"],
+            check=True,
+        )
+        whisper_bin = _find_whisper_bin()
+        if not whisper_bin:
+            sys.exit("Error: whisper.cpp build failed")
+        log(f"Built: {whisper_bin}")
+
+    if not MODEL_PATH.exists():
+        MODEL_DIR.mkdir(parents=True, exist_ok=True)
+        log("Downloading base.en model (~150 MB)...")
+        subprocess.run(
+            ["curl", "-L", "--progress-bar", "-o", str(MODEL_PATH), MODEL_URL],
+            check=True,
+        )
+        log("Model ready")
+
+
+def ensure_system_audio_tap():
+    """Build the Swift system-audio-tap helper if not already built."""
+    if SYSTEM_TAP_BIN.exists() and os.access(SYSTEM_TAP_BIN, os.X_OK):
+        return
+    if not (SWIFT_PROJECT / "Package.swift").exists():
+        log("system-audio-tap Swift project not found — skipping system audio")
+        return
+    log("Building system-audio-tap (Swift, ScreenCaptureKit)...")
+    subprocess.run(
+        ["swift", "build", "-c", "release"],
+        cwd=str(SWIFT_PROJECT),
+        check=True,
+    )
+    if not SYSTEM_TAP_BIN.exists():
+        sys.exit("Error: system-audio-tap build failed")
+    log(f"Built: {SYSTEM_TAP_BIN}")
+
+
+def setup():
+    if not shutil.which("brew"):
+        sys.exit("Error: Homebrew is required — https://brew.sh")
+    ensure_ffmpeg()
+    ensure_whisper()
+    ensure_system_audio_tap()
+
+
+# ── Audio devices (mic only — system audio uses ScreenCaptureKit) ─────────
+
+
+def list_audio_devices():
+    """Return [(index, name), ...] from ffmpeg/AVFoundation."""
+    r = subprocess.run(
+        ["ffmpeg", "-f", "avfoundation", "-list_devices", "true", "-i", ""],
+        capture_output=True,
+        text=True,
+    )
+    in_audio = False
+    devices = []
+    for line in r.stderr.splitlines():
+        if "AVFoundation audio devices:" in line:
+            in_audio = True
+            continue
+        if in_audio:
+            m = re.search(r"\[AVFoundation.*?\]\s+\[(\d+)\]\s+(.*)", line)
+            if m:
+                devices.append((int(m.group(1)), m.group(2).strip()))
+    return devices
+
+
+# ── Recording ──────────────────────────────────────────────────────────────
+
+
+def record_mic_chunk(device_index, out_path, duration):
+    """Record mic via ffmpeg. Returns Popen."""
+    cmd = [
+        "ffmpeg", "-y",
+        "-f", "avfoundation",
+        "-i", f":{device_index}",
+        "-ac", "1",
+        "-ar", "16000",
+        "-t", str(duration),
+        "-loglevel", "error",
+        str(out_path),
+    ]
+    return subprocess.Popen(cmd, stdin=subprocess.DEVNULL)
+
+
+def record_system_chunk(out_path, duration):
+    """Record system audio via ScreenCaptureKit. Returns Popen."""
+    cmd = [
+        str(SYSTEM_TAP_BIN),
+        "--output", str(out_path),
+        "--duration", str(duration),
+    ]
+    return subprocess.Popen(cmd, stdin=subprocess.DEVNULL)
+
+
+# ── Audio conversion ───────────────────────────────────────────────────────
+
+
+def convert_to_whisper_format(in_path, out_path):
+    """Convert any WAV to 16kHz mono PCM (what whisper expects)."""
+    subprocess.run(
+        [
+            "ffmpeg", "-y",
+            "-i", str(in_path),
+            "-ac", "1",
+            "-ar", "16000",
+            "-loglevel", "error",
+            str(out_path),
+        ],
+        check=True,
+        timeout=30,
+    )
+
+
+# ── Transcription ──────────────────────────────────────────────────────────
+
+
+def transcribe_timestamped(audio_path):
+    """Run whisper and return [(start_sec, end_sec, text), ...]."""
+    r = subprocess.run(
+        [str(whisper_bin), "-m", str(MODEL_PATH), "-f", str(audio_path)],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    segments = []
+    combined = r.stdout + "\n" + r.stderr
+    for line in combined.splitlines():
+        m = re.match(
+            r"\[(\d+):(\d+):(\d+\.\d+)\s*-->\s*(\d+):(\d+):(\d+\.\d+)\]\s*(.*)",
+            line,
+        )
+        if m:
+            s = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
+            e = int(m.group(4)) * 3600 + int(m.group(5)) * 60 + float(m.group(6))
+            text = m.group(7).strip()
+            if text and not re.match(r"^\[.*\]$", text) and not re.match(
+                r"^\(.*\)$", text
+            ):
+                segments.append((s, e, text))
+    return segments
+
+
+def transcribe_plain(audio_path):
+    """Run whisper with no timestamps, return plain text."""
+    r = subprocess.run(
+        [str(whisper_bin), "-m", str(MODEL_PATH), "-f", str(audio_path), "-nt"],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    text = r.stdout.strip()
+    if not text:
+        text = r.stderr.strip()
+    text = re.sub(r"\[BLANK_AUDIO\]", "", text)
+    text = re.sub(r"\(silence\)", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"(.{10,}?)\1{3,}", r"\1", text)
+    return text.strip()
+
+
+# ── Deduplication ──────────────────────────────────────────────────────────
+
+
+def _text_similarity(a, b):
+    """Return 0.0–1.0 similarity ratio between two strings."""
+    return difflib.SequenceMatcher(None, a.lower(), b.lower()).ratio()
+
+
+def _deduplicate(merged):
+    """Remove mic segments that are echoes of system audio.
+
+    When speakers are used (no headphones), the mic picks up whatever the
+    computer is playing.  This produces near-duplicate segments where "You"
+    and "Them" say almost the same thing at the same time.
+
+    Strategy: for every "You" segment, look for a "Them" segment within
+    ±5 seconds.  If the text similarity is >0.5, the mic just recorded the
+    speaker output — drop the "You" segment and keep the cleaner "Them".
+    """
+    if not merged:
+        return merged
+
+    # Index Them segments for quick lookup
+    them_segs = [(s, t) for s, speaker, t in merged if speaker == "Them"]
+
+    drop = set()
+    for i, (offset, speaker, text) in enumerate(merged):
+        if speaker != "You":
+            continue
+        for them_offset, them_text in them_segs:
+            if abs(offset - them_offset) > 5.0:
+                continue
+            if _text_similarity(text, them_text) > 0.5:
+                drop.add(i)
+                break
+
+    if drop:
+        log(f"Dedup: dropped {len(drop)} mic echo(es)")
+
+    return [seg for i, seg in enumerate(merged) if i not in drop]
+
+
+# ── Chunk processing ───────────────────────────────────────────────────────
+
+
+def process_dual_chunk(mic_wav, sys_wav, md_path, chunk_start):
+    """Transcribe mic + system audio, merge by timestamp, append to file."""
+    sys_converted = None
+    try:
+        # Convert system audio from 48kHz stereo to 16kHz mono for whisper
+        sys_converted = sys_wav.with_suffix(".16k.wav")
+        convert_to_whisper_format(sys_wav, sys_converted)
+
+        mic_segs = transcribe_timestamped(mic_wav)
+        sys_segs = transcribe_timestamped(sys_converted)
+
+        merged = []
+        for s, _e, t in mic_segs:
+            merged.append((s, "You", t))
+        for s, _e, t in sys_segs:
+            merged.append((s, "Them", t))
+        merged.sort(key=lambda x: x[0])
+
+        # Remove mic segments that are echoes of system audio
+        merged = _deduplicate(merged)
+
+        if not merged:
+            log("(no speech detected)")
+            return
+
+        lines = []
+        for offset, speaker, text in merged:
+            abs_time = chunk_start + datetime.timedelta(seconds=offset)
+            ts = abs_time.strftime("%H:%M:%S")
+            lines.append(f"**[{ts}] {speaker}:** {text}")
+
+        block = "\n\n".join(lines) + "\n\n"
+        with file_lock:
+            with open(md_path, "a") as f:
+                f.write(block)
+
+        preview = merged[0][2][:80] if merged else ""
+        log(f"{len(merged)} segment(s) transcribed -- {preview}")
+
+    except Exception as exc:
+        log(f"Transcription error: {exc}")
+    finally:
+        for p in (mic_wav, sys_wav, sys_converted):
+            if p is None:
+                continue
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
+
+
+def process_single_chunk(mic_wav, md_path, chunk_start):
+    """Transcribe mic audio, append to file."""
+    try:
+        text = transcribe_plain(mic_wav)
+        if not text:
+            log("(no speech detected)")
+            return
+
+        ts = chunk_start.strftime("%H:%M:%S")
+        with file_lock:
+            with open(md_path, "a") as f:
+                f.write(f"**[{ts}]** {text}\n\n")
+
+        log(f"{text[:80]}{'...' if len(text) > 80 else ''}")
+
+    except Exception as exc:
+        log(f"Transcription error: {exc}")
+    finally:
+        try:
+            os.unlink(mic_wav)
+        except OSError:
+            pass
+
+
+# ── Main loop ──────────────────────────────────────────────────────────────
+
+
+def run(md_path, mic_idx, dual, chunk_duration, duration_minutes=None):
+    global running
+
+    tmp = Path(tempfile.mkdtemp(prefix="transcribe_"))
+    n = 0
+
+    deadline = None
+    if duration_minutes:
+        deadline = datetime.datetime.now() + datetime.timedelta(minutes=duration_minutes)
+
+    now = datetime.datetime.now()
+    with open(md_path, "a") as f:
+        f.write(f"\n\n---\n\n## Transcript -- {now.strftime('%Y-%m-%d %H:%M')}\n\n")
+
+    mode = "Dual (mic + system)" if dual else "Mic only"
+    log(f"Output: {md_path}")
+    dur_str = f" | Duration: {duration_minutes}min" if duration_minutes else ""
+    log(f"Mode: {mode} | Chunk: {chunk_duration}s{dur_str}")
+    if deadline:
+        log(f"Will auto-stop at {deadline.strftime('%H:%M:%S')}")
+    log("Press Ctrl-C to stop\n")
+
+    def on_signal(sig, _frame):
+        global running
+        running = False
+
+    signal.signal(signal.SIGINT, on_signal)
+    signal.signal(signal.SIGTERM, on_signal)
+
+    try:
+        while running:
+            # Check if timed recording has expired
+            if deadline and datetime.datetime.now() >= deadline:
+                log(f"Duration reached ({duration_minutes}min) — stopping.")
+                break
+
+            n += 1
+            chunk_start = datetime.datetime.now()
+
+            # Start mic recording
+            mic_wav = tmp / f"mic_{n:05d}.wav"
+            mic_proc = record_mic_chunk(mic_idx, mic_wav, chunk_duration)
+
+            # Start system audio recording (via ScreenCaptureKit)
+            sys_proc = None
+            sys_wav = None
+            if dual:
+                sys_wav = tmp / f"sys_{n:05d}.wav"
+                sys_proc = record_system_chunk(sys_wav, chunk_duration)
+
+            # Wait for recordings to complete
+            mic_proc.wait()
+            if sys_proc:
+                sys_proc.wait()
+
+            # Check we got usable audio
+            if not mic_wav.exists() or mic_wav.stat().st_size < 1000:
+                if not running:
+                    break
+                continue
+
+            # Transcribe in background thread
+            if dual and sys_wav and sys_wav.exists() and sys_wav.stat().st_size > 1000:
+                t = threading.Thread(
+                    target=process_dual_chunk,
+                    args=(mic_wav, sys_wav, md_path, chunk_start),
+                    daemon=True,
+                )
+            else:
+                # Fall back to mic-only if system audio is empty
+                if sys_wav and sys_wav.exists():
+                    try:
+                        os.unlink(sys_wav)
+                    except OSError:
+                        pass
+                t = threading.Thread(
+                    target=process_single_chunk,
+                    args=(mic_wav, md_path, chunk_start),
+                    daemon=True,
+                )
+            t.start()
+            pending_threads.append(t)
+
+            pending_threads[:] = [t for t in pending_threads if t.is_alive()]
+
+    finally:
+        if pending_threads:
+            log("Finishing pending transcriptions...")
+            for t in pending_threads:
+                t.join(timeout=60)
+        shutil.rmtree(tmp, ignore_errors=True)
+        log("Done.")
+
+
+# ── CLI ────────────────────────────────────────────────────────────────────
+
+
+def main():
+    p = argparse.ArgumentParser(
+        description="Record & transcribe audio to markdown (whisper.cpp + ScreenCaptureKit)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  %(prog)s notes.md                Record mic + system audio -> notes.md
+  %(prog)s --duration 30 meeting.md  Record for 30 minutes then auto-stop
+  %(prog)s --mic-only notes.md     Record mic only (no system audio)
+  %(prog)s --devices               List mic devices
+  %(prog)s --mic 2 notes.md        Use specific mic
+  %(prog)s --chunk 30 notes.md     Use 30-second chunks
+  %(prog)s --setup                 Install dependencies only
+        """,
+    )
+    p.add_argument("file", nargs="?", help="Markdown file to append transcript to")
+    p.add_argument(
+        "--setup", action="store_true", help="Install dependencies and exit"
+    )
+    p.add_argument(
+        "--devices", action="store_true", help="List audio input devices"
+    )
+    p.add_argument(
+        "--duration", type=float, default=None, metavar="MIN",
+        help="Auto-stop after this many minutes (e.g., 30 for a 30-min meeting)",
+    )
+    p.add_argument(
+        "--mic", type=int, default=None, metavar="IDX",
+        help="Microphone device index (default: auto-detect)",
+    )
+    p.add_argument(
+        "--mic-only", action="store_true",
+        help="Record microphone only (skip system audio capture)",
+    )
+    p.add_argument(
+        "--chunk", type=int, default=DEFAULT_CHUNK, metavar="SEC",
+        help=f"Chunk duration in seconds (default: {DEFAULT_CHUNK})",
+    )
+
+    args = p.parse_args()
+
+    # ── Setup dependencies ─────────────────────────────────────────────
+    setup()
+
+    if args.setup:
+        log("All dependencies ready.")
+        return
+
+    # ── List devices ───────────────────────────────────────────────────
+    if args.devices:
+        devs = list_audio_devices()
+        if not devs:
+            print("No audio devices found.")
+        else:
+            print("Microphone devices (use index with --mic):\n")
+            for idx, name in devs:
+                print(f"  [{idx}]  {name}")
+            print("\n  System audio is captured automatically via ScreenCaptureKit.")
+            print("  No extra devices or setup needed.")
+        return
+
+    # ── Validate ───────────────────────────────────────────────────────
+    if not args.file:
+        p.error("Please provide a markdown file path")
+
+    md_path = Path(args.file).resolve()
+    md_path.parent.mkdir(parents=True, exist_ok=True)
+    if not md_path.exists():
+        md_path.touch()
+
+    # ── Select mic ─────────────────────────────────────────────────────
+    devs = list_audio_devices()
+    if not devs:
+        sys.exit("Error: no audio devices found")
+
+    mic_idx = args.mic
+    if mic_idx is None:
+        for idx, name in devs:
+            if "macbook" in name.lower() and "mic" in name.lower():
+                mic_idx = idx
+                break
+        if mic_idx is None:
+            mic_idx = devs[0][0]
+
+    mic_name = next((n for i, n in devs if i == mic_idx), f"Device {mic_idx}")
+    log(f"Mic: [{mic_idx}] {mic_name}")
+
+    # ── Determine dual mode ────────────────────────────────────────────
+    dual = False
+    if not args.mic_only:
+        if SYSTEM_TAP_BIN.exists() and os.access(SYSTEM_TAP_BIN, os.X_OK):
+            dual = True
+            log("System audio: ScreenCaptureKit (automatic)")
+        else:
+            log("System audio: not available (system-audio-tap not built)")
+    else:
+        log("System audio: disabled (--mic-only)")
+
+    # ── Run ────────────────────────────────────────────────────────────
+    run(md_path, mic_idx, dual, args.chunk, args.duration)
+
+
+if __name__ == "__main__":
+    main()
