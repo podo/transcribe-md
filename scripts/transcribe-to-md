@@ -14,10 +14,12 @@ acceleration, downloads the base.en model (~150 MB), and builds a small
 Swift helper for system audio capture.
 
 Usage:
-    transcribe-to-md notes.md              Record mic + system audio
-    transcribe-to-md --mic-only notes.md   Record mic only
-    transcribe-to-md --devices             List mic devices
-    transcribe-to-md --setup               Install dependencies only
+    transcribe-to-md notes.md                    Record mic + system audio
+    transcribe-to-md --mic-only notes.md          Record mic only
+    transcribe-to-md --devices                    List mic devices
+    transcribe-to-md --setup                      Install dependencies only
+    transcribe-to-md --language lt meeting.md     Record in Lithuanian
+    transcribe-to-md --language auto notes.md     Auto-detect language
 """
 
 import argparse
@@ -46,16 +48,31 @@ SYSTEM_TAP_BIN = SWIFT_PROJECT / ".build" / "release" / "system-audio-tap"
 CACHE_DIR = Path.home() / ".cache" / "transcribe-cli"
 WHISPER_DIR = CACHE_DIR / "whisper.cpp"
 MODEL_DIR = CACHE_DIR / "models"
-MODEL_PATH = MODEL_DIR / "ggml-base.en.bin"
-MODEL_URL = (
-    "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin"
-)
 DEFAULT_CHUNK = 10  # seconds
+
+HF_BASE = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main"
+
+# Model registry: name -> (filename, download_url, multilingual)
+MODELS = {
+    "base.en": (
+        "ggml-base.en.bin",
+        f"{HF_BASE}/ggml-base.en.bin",
+        False,  # English-only — never pass -l to whisper-cli
+    ),
+    "large-v3-turbo-q5": (
+        "ggml-large-v3-turbo-q5_0.bin",
+        f"{HF_BASE}/ggml-large-v3-turbo-q5_0.bin",
+        True,   # multilingual
+    ),
+}
+DEFAULT_MODEL = "base.en"
 
 # ── Globals ────────────────────────────────────────────────────────────────
 
 running = True
 whisper_bin = None
+active_model_path = None    # set by ensure_whisper() before recording
+active_language_flag = None  # e.g. "lt", or None for English
 pending_threads = []
 file_lock = threading.Lock()
 
@@ -85,7 +102,8 @@ def _find_whisper_bin():
     return None
 
 
-def ensure_whisper():
+def _ensure_whisper_binary():
+    """Clone and build whisper.cpp if needed; sets whisper_bin global."""
     global whisper_bin
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -121,14 +139,25 @@ def ensure_whisper():
             sys.exit("Error: whisper.cpp build failed")
         log(f"Built: {whisper_bin}")
 
-    if not MODEL_PATH.exists():
+
+def ensure_whisper(model_name=DEFAULT_MODEL, language=None):
+    global active_model_path, active_language_flag
+    _ensure_whisper_binary()
+
+    filename, url, multilingual = MODELS[model_name]
+    model_path = MODEL_DIR / filename
+    if not model_path.exists():
         MODEL_DIR.mkdir(parents=True, exist_ok=True)
-        log("Downloading base.en model (~150 MB)...")
+        size_hint = "~500 MB" if "turbo" in filename else "~150 MB"
+        log(f"Downloading {filename} ({size_hint})...")
         subprocess.run(
-            ["curl", "-L", "--progress-bar", "-o", str(MODEL_PATH), MODEL_URL],
+            ["curl", "-L", "--progress-bar", "-o", str(model_path), url],
             check=True,
         )
         log("Model ready")
+
+    active_model_path = model_path
+    active_language_flag = language if (multilingual and language and language != "en") else None
 
 
 def ensure_system_audio_tap():
@@ -149,11 +178,11 @@ def ensure_system_audio_tap():
     log(f"Built: {SYSTEM_TAP_BIN}")
 
 
-def setup():
+def setup(model_name=DEFAULT_MODEL, language=None):
     if not shutil.which("brew"):
         sys.exit("Error: Homebrew is required — https://brew.sh")
     ensure_ffmpeg()
-    ensure_whisper()
+    ensure_whisper(model_name=model_name, language=language)
     ensure_system_audio_tap()
 
 
@@ -232,8 +261,11 @@ def convert_to_whisper_format(in_path, out_path):
 
 def transcribe_timestamped(audio_path):
     """Run whisper and return [(start_sec, end_sec, text), ...]."""
+    cmd = [str(whisper_bin), "-m", str(active_model_path), "-f", str(audio_path)]
+    if active_language_flag:
+        cmd += ["-l", active_language_flag]
     r = subprocess.run(
-        [str(whisper_bin), "-m", str(MODEL_PATH), "-f", str(audio_path)],
+        cmd,
         capture_output=True,
         text=True,
         timeout=120,
@@ -258,8 +290,11 @@ def transcribe_timestamped(audio_path):
 
 def transcribe_plain(audio_path):
     """Run whisper with no timestamps, return plain text."""
+    cmd = [str(whisper_bin), "-m", str(active_model_path), "-f", str(audio_path), "-nt"]
+    if active_language_flag:
+        cmd += ["-l", active_language_flag]
     r = subprocess.run(
-        [str(whisper_bin), "-m", str(MODEL_PATH), "-f", str(audio_path), "-nt"],
+        cmd,
         capture_output=True,
         text=True,
         timeout=120,
@@ -407,8 +442,9 @@ def run(md_path, mic_idx, dual, chunk_duration, duration_minutes=None):
         deadline = datetime.datetime.now() + datetime.timedelta(minutes=duration_minutes)
 
     now = datetime.datetime.now()
+    lang_note = f" [{active_language_flag.upper()}]" if active_language_flag else ""
     with open(md_path, "a") as f:
-        f.write(f"\n\n---\n\n## Transcript -- {now.strftime('%Y-%m-%d %H:%M')}\n\n")
+        f.write(f"\n\n---\n\n## Transcript{lang_note} -- {now.strftime('%Y-%m-%d %H:%M')}\n\n")
 
     mode = "Dual (mic + system)" if dual else "Mic only"
     log(f"Output: {md_path}")
@@ -499,13 +535,15 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  %(prog)s notes.md                Record mic + system audio -> notes.md
-  %(prog)s --duration 30 meeting.md  Record for 30 minutes then auto-stop
-  %(prog)s --mic-only notes.md     Record mic only (no system audio)
-  %(prog)s --devices               List mic devices
-  %(prog)s --mic 2 notes.md        Use specific mic
-  %(prog)s --chunk 30 notes.md     Use 30-second chunks
-  %(prog)s --setup                 Install dependencies only
+  %(prog)s notes.md                      Record mic + system audio -> notes.md
+  %(prog)s --duration 30 meeting.md      Record for 30 minutes then auto-stop
+  %(prog)s --mic-only notes.md           Record mic only (no system audio)
+  %(prog)s --devices                     List mic devices
+  %(prog)s --mic 2 notes.md              Use specific mic
+  %(prog)s --chunk 30 notes.md           Use 30-second chunks
+  %(prog)s --setup                       Install dependencies only
+  %(prog)s --language lt susitikimas.md  Record in Lithuanian
+  %(prog)s --language auto notes.md      Auto-detect spoken language
         """,
     )
     p.add_argument("file", nargs="?", help="Markdown file to append transcript to")
@@ -531,14 +569,52 @@ Examples:
         "--chunk", type=int, default=DEFAULT_CHUNK, metavar="SEC",
         help=f"Chunk duration in seconds (default: {DEFAULT_CHUNK})",
     )
+    p.add_argument(
+        "--language", "-l", default="en", metavar="LANG",
+        help=(
+            "Spoken language code (default: en). Use 'lt' for Lithuanian, "
+            "'auto' to auto-detect. Non-English languages automatically use "
+            "the multilingual model (~500 MB, downloaded once)."
+        ),
+    )
+    p.add_argument(
+        "--model", default=None, metavar="NAME_OR_PATH",
+        help=(
+            "Override model. Built-in names: base.en, large-v3-turbo-q5. "
+            "Or provide an absolute path to a custom .bin file."
+        ),
+    )
 
     args = p.parse_args()
 
-    # ── Setup dependencies ─────────────────────────────────────────────
-    setup()
+    # ── Resolve language and model ─────────────────────────────────────
+    language = (args.language or "en").lower()
+
+    if args.model and Path(args.model).exists():
+        # User provided a path to a local .bin (e.g., GGML fine-tuned model)
+        global active_model_path, active_language_flag
+        active_model_path = Path(args.model)
+        active_language_flag = language if language != "en" else None
+        if not shutil.which("brew"):
+            sys.exit("Error: Homebrew is required — https://brew.sh")
+        ensure_ffmpeg()
+        _ensure_whisper_binary()
+        ensure_system_audio_tap()
+    else:
+        if args.model and args.model not in MODELS:
+            p.error(f"Unknown model '{args.model}'. Valid names: {', '.join(MODELS)}")
+        if args.model:
+            chosen_model = args.model
+        elif language == "en":
+            chosen_model = "base.en"
+        else:
+            chosen_model = "large-v3-turbo-q5"
+            log(f"Language '{language}' — using multilingual model (large-v3-turbo-q5, ~500 MB, one-time download)")
+        setup(model_name=chosen_model, language=language)
 
     if args.setup:
         log("All dependencies ready.")
+        log(f"Model: {active_model_path}")
         return
 
     # ── List devices ───────────────────────────────────────────────────
