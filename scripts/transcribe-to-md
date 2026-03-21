@@ -569,10 +569,12 @@ Examples:
         "--chunk", type=int, default=DEFAULT_CHUNK, metavar="SEC",
         help=f"Chunk duration in seconds (default: {DEFAULT_CHUNK})",
     )
+    default_lang = os.environ.get("TRANSCRIBE_MD_LANGUAGE", "en")
     p.add_argument(
-        "--language", "-l", default="en", metavar="LANG",
+        "--language", "-l", default=default_lang, metavar="LANG",
         help=(
-            "Spoken language code (default: en). Use 'lt' for Lithuanian, "
+            f"Spoken language code (default: {default_lang!r}, from "
+            "$TRANSCRIBE_MD_LANGUAGE env var). Use 'lt' for Lithuanian, "
             "'auto' to auto-detect. Non-English languages automatically use "
             "the multilingual model (~500 MB, downloaded once)."
         ),

@@ -25,7 +25,7 @@ Record and transcribe audio to a timestamped markdown file using whisper.cpp wit
 - `--mic <IDX>` — Use a specific microphone by device index
 - `--chunk <SEC>` — Chunk duration in seconds (default: 10)
 - `--setup` — Install/verify dependencies without recording
-- `--language <CODE>` — Spoken language code (default: `en`). Use `lt` for Lithuanian, `auto` to auto-detect. Non-English automatically downloads the multilingual model (~500 MB, one-time).
+- `--language <CODE>` — Spoken language code (default: `en`, or `$TRANSCRIBE_MD_LANGUAGE` env var). Use `lt` for Lithuanian, `auto` to auto-detect. Non-English automatically downloads the multilingual model (~500 MB, one-time).
 - `--model <NAME|PATH>` — Override the model. Built-in names: `base.en` (~150 MB, English only), `large-v3-turbo-q5` (~500 MB, multilingual). Or provide an absolute path to a custom `.bin` file.
 
 ### Examples

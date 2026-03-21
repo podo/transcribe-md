@@ -97,8 +97,9 @@ fi
 
 # ── Dependencies ────────────────────────────────────────────────────────────
 
-info "Installing dependencies (ffmpeg, whisper.cpp, model, system-audio-tap)"
+info "Installing dependencies (ffmpeg, whisper.cpp, models, system-audio-tap)"
 "$INSTALL_DIR/scripts/transcribe-to-md" --setup
+"$INSTALL_DIR/scripts/transcribe-to-md" --setup --language lt
 
 # ── Done ────────────────────────────────────────────────────────────────────
 
@@ -107,6 +108,10 @@ info "Done! transcribe-md is ready."
 echo ""
 echo "  Claude Code:  /transcribe-md"
 echo "  Cursor:       /transcribe-md"
+echo ""
+echo "  Use --language lt for Lithuanian (model already downloaded)."
+echo "  To make Lithuanian the default, add to your shell profile:"
+echo "    export TRANSCRIBE_MD_LANGUAGE=lt"
 echo ""
 echo "  System audio requires Screen Recording permission for your terminal."
 echo "  If the permission dialog doesn't appear, grant it manually:"
