@@ -6,14 +6,12 @@ allowed-tools: Bash
 
 # Transcribe to Markdown
 
-Record and transcribe audio to a timestamped markdown file using whisper.cpp with Metal acceleration. Captures both microphone and system audio (via ScreenCaptureKit).
+Record and transcribe audio to a timestamped markdown file using whisper.cpp with Metal acceleration. Captures both microphone and system audio (via ScreenCaptureKit). Supports 99 languages.
 
 ## Usage
 
 ```bash
-~/.local/share/transcribe-md/scripts/transcribe-to-md <file.md>
-~/.local/share/transcribe-md/scripts/transcribe-to-md --duration 30 meeting.md
-~/.local/share/transcribe-md/scripts/transcribe-to-md --mic-only notes.md
+~/.local/share/transcribe-md/scripts/transcribe-to-md <file.md> [options]
 ```
 
 ### Parameters
@@ -25,8 +23,8 @@ Record and transcribe audio to a timestamped markdown file using whisper.cpp wit
 - `--mic <IDX>` — Use a specific microphone by device index
 - `--chunk <SEC>` — Chunk duration in seconds (default: 10)
 - `--setup` — Install/verify dependencies without recording
-- `--language <CODE>` — Spoken language code (default: `en`, or `$TRANSCRIBE_MD_LANGUAGE` env var). Use `lt` for Lithuanian, `auto` to auto-detect. Non-English automatically downloads the multilingual model (~500 MB, one-time).
-- `--model <NAME|PATH>` — Override the model. Built-in names: `base.en` (~150 MB, English only), `large-v3-turbo-q5` (~500 MB, multilingual). Or provide an absolute path to a custom `.bin` file.
+- `--language <CODE>` — Spoken language code (default: `en`, or `$TRANSCRIBE_MD_LANGUAGE` env var). Use `lt` for Lithuanian, `auto` to auto-detect. Non-English automatically uses the multilingual model (~500 MB, pre-downloaded by installer).
+- `--model <NAME|PATH>` — Override model: `base.en` (~150 MB, English only), `large-v3-turbo-q5` (~500 MB, multilingual), or absolute path to a custom `.bin` file.
 
 ### Examples
 
@@ -35,33 +33,49 @@ Record and transcribe audio to a timestamped markdown file using whisper.cpp wit
 - `/transcribe-md --mic-only dictation.md` — Mic only, no system audio
 - `/transcribe-md --devices` — List available microphones
 - `/transcribe-md --language lt susitikimas.md` — Record Lithuanian meeting
-- `/transcribe-md --language auto --duration 30 meeting.md` — Auto-detect language
-- `/transcribe-md` — Ask what to transcribe, suggest a filename, ask if they want a time limit
+- `/transcribe-md --language lt --duration 30 meeting.md` — Lithuanian, 30-minute limit
+- `/transcribe-md --language auto notes.md` — Auto-detect spoken language
+
+### When invoked without arguments
+
+Ask the user:
+1. What to transcribe and suggest a filename
+2. Whether they want a time limit (`--duration`)
+3. **What language they'll be speaking** — if not English, add `--language <code>` (e.g. `--language lt` for Lithuanian)
 
 ### How it works
 
 - Records mic via ffmpeg and system audio via a Swift helper (ScreenCaptureKit)
 - Transcribes in real-time using whisper.cpp with Metal GPU acceleration
+- English uses `base.en` model; all other languages use `large-v3-turbo-q5` (multilingual)
 - Mic echoes of system audio are automatically deduplicated
 - Output: `**[HH:MM:SS] You:** text` and `**[HH:MM:SS] Them:** text`
+- Non-English transcripts include the language code in the header: `## Transcript [LT] -- ...`
 
 ### Multilingual Support
 
-Non-English languages use the `large-v3-turbo-q5` model (~500 MB, downloaded once on first use). For Lithuanian, expected Word Error Rate is ~22–25%.
+The multilingual model is pre-downloaded during installation — no extra setup needed. Just pass `--language <code>`:
 
-**Higher accuracy for Lithuanian** (~20.7% WER): Convert the `DrishtiSharma/whisper-large-v2-lithuanian` HuggingFace model to GGML format, then use `--model`:
+```
+lt  Lithuanian      de  German         fr  French
+ja  Japanese        zh  Chinese        es  Spanish
+uk  Ukrainian       pl  Polish         ru  Russian
+```
 
+To avoid typing `--language lt` every time, the user can set:
 ```bash
-# One-time conversion (requires Python + transformers + torch)
+export TRANSCRIBE_MD_LANGUAGE=lt   # in ~/.zshrc
+```
+
+**Higher accuracy for Lithuanian** via a fine-tuned GGML model (~20.7% WER vs ~22-25%):
+```bash
 pip install transformers torch
 git clone https://huggingface.co/DrishtiSharma/whisper-large-v2-lithuanian
 python3 ~/.cache/transcribe-cli/whisper.cpp/models/convert-h5-to-ggml.py \
     ./whisper-large-v2-lithuanian \
     ~/.cache/transcribe-cli/whisper.cpp \
     ~/.cache/transcribe-cli/models/
-
-# Then use it:
-/transcribe-md --model ~/.cache/transcribe-cli/models/ggml-model.bin --language lt notes.md
+# Then: /transcribe-md --model ~/.cache/transcribe-cli/models/ggml-model.bin --language lt notes.md
 ```
 
 ### Dependencies
