@@ -80,11 +80,42 @@ Or run the script directly:
 | `--duration <MIN>`    | Auto-stop after N minutes                                      |
 | `--mic-only`          | Skip system audio capture                                      |
 | `--mic <IDX>`         | Use a specific microphone by device index                      |
-| `--chunk <SEC>`       | Chunk duration in seconds (default: 10)                        |
+| `--chunk <SEC>`       | Chunk duration. Default: 10s for English, 20s for non-English (Whisper trains on 30s windows, so 10s causes mid-word splices in inflectional languages) |
 | `--language <CODE>`   | Spoken language code (default: `en`). See [Languages](#languages) |
 | `--model <NAME\|PATH>` | Override model: `base.en`, `large-v3-turbo-q5`, or a `.bin` path |
+| `--prompt <TEXT>`     | Initial-prompt vocabulary hint passed to whisper. Useful for code-switched LT+English speech (e.g. `--prompt 'workshop design API frontend backend'`) |
+| `--enhance`           | Post-process each transcribed segment via `claude -p` for typo/morphology correction and English-term restoration. See [Enhanced transcription](#enhanced-transcription) |
+| `--enhance-model <ALIAS>` | Model alias for `--enhance` (default: `sonnet`)            |
 | `--devices`           | List available microphone devices                              |
 | `--setup`             | Install/verify dependencies without recording                  |
+
+## Enhanced transcription
+
+For low-resource languages like Lithuanian, even `large-v3-turbo` produces transcripts with ~28% word error rate on clean speech and ~30-40% on conversational/code-switched audio. Common errors: morphology slips ("priežas" instead of "priežastys"), missing word boundaries, phonetic mangling of English tech terms ("vorkšapa" instead of "workshop").
+
+The `--enhance` flag runs each transcribed segment through your active Claude Code session (`claude -p`) for a cleanup pass before writing to markdown. The cleanup model is prompted to:
+
+- Fix phonetic mangling and morphology
+- Restore English tech terms to their proper spelling
+- Mark unrecoverable garbled sections as `[unclear]`
+- **Never** paraphrase, summarize, or invent content
+
+```bash
+# Lithuanian meeting with LLM cleanup:
+/transcribe-md --language lt --enhance susitikimas.md
+
+# Add a vocabulary prompt to bias toward your typical tech terms:
+/transcribe-md --language lt --enhance \
+               --prompt 'workshop skills API frontend backend prototype' \
+               meeting.md
+```
+
+**Cost & latency:**
+
+- Uses your current Claude Code session auth — **no separate API key needed**.
+- Adds ~3-5 sec per chunk, but the cleanup runs *in parallel* with the next chunk's whisper, so end-to-end real-time experience is preserved.
+- Approximate cost (when routed to a metered Claude tier): ~$0.02 per hour of recording. Effectively free when routed via a flat-rate Claude Code subscription.
+- **Any cleanup failure (CLI missing, timeout, network error) silently falls back to the raw whisper output**, so the recording is never broken by enhancement.
 
 ## Languages
 

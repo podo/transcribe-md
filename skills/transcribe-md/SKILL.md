@@ -21,10 +21,13 @@ Record and transcribe audio to a timestamped markdown file using whisper.cpp wit
 - `--mic-only` — Skip system audio capture (mic only)
 - `--devices` — List available microphone devices
 - `--mic <IDX>` — Use a specific microphone by device index
-- `--chunk <SEC>` — Chunk duration in seconds (default: 10)
+- `--chunk <SEC>` — Chunk duration in seconds (default: 10s for English, 20s for non-English — Whisper was trained on 30s windows, so 10s causes mid-word splices on inflectional languages)
 - `--setup` — Install/verify dependencies without recording
 - `--language <CODE>` — Spoken language code (default: `en`, or `$TRANSCRIBE_MD_LANGUAGE` env var). Use `lt` for Lithuanian, `auto` to auto-detect. Non-English automatically uses the multilingual model (~500 MB, pre-downloaded by installer).
 - `--model <NAME|PATH>` — Override model: `base.en` (~150 MB, English only), `large-v3-turbo-q5` (~500 MB, multilingual), or absolute path to a custom `.bin` file.
+- `--prompt <TEXT>` — Initial-prompt vocabulary hint for whisper. Useful for code-switched LT+English speech, e.g. `--prompt 'workshop design API frontend backend'` to preserve English tech terms.
+- `--enhance` — Post-process each transcribed segment via `claude -p` (your current Claude Code session — no separate API key) to correct phonetic errors, fix morphology, and restore code-switched English terms. Adds ~3-5s per chunk, runs in parallel with next chunk's whisper. Falls back to raw output on any failure.
+- `--enhance-model <ALIAS>` — Model alias for `--enhance` (default: `sonnet`).
 
 ### Examples
 
@@ -35,6 +38,8 @@ Record and transcribe audio to a timestamped markdown file using whisper.cpp wit
 - `/transcribe-md --language lt susitikimas.md` — Record Lithuanian meeting
 - `/transcribe-md --language lt --duration 30 meeting.md` — Lithuanian, 30-minute limit
 - `/transcribe-md --language auto notes.md` — Auto-detect spoken language
+- `/transcribe-md --language lt --enhance meeting.md` — Lithuanian + LLM cleanup of each chunk
+- `/transcribe-md --language lt --enhance --prompt 'workshop design API' meeting.md` — Tech-meeting setup
 
 ### When invoked without arguments
 
@@ -51,6 +56,7 @@ Ask the user:
 - Mic echoes of system audio are automatically deduplicated
 - Output: `**[HH:MM:SS] You:** text` and `**[HH:MM:SS] Them:** text`
 - Non-English transcripts include the language code in the header: `## Transcript [LT] -- ...`
+- With `--enhance`: each chunk's whisper output is passed through `claude -p` for cleanup (typos, morphology, English code-switch restoration) before being written to markdown. The cleanup uses session auth (no separate API key), runs in parallel with the next chunk's whisper, and falls back silently to raw whisper text on any failure.
 
 ### Multilingual Support
 

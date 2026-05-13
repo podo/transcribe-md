@@ -25,6 +25,7 @@ Usage:
 import argparse
 import datetime
 import difflib
+import json
 import os
 import re
 import shutil
@@ -75,6 +76,66 @@ active_model_path = None    # set by ensure_whisper() before recording
 active_language_flag = None  # e.g. "lt", or None for English
 pending_threads = []
 file_lock = threading.Lock()
+
+# Optional whisper initial prompt: biases the decoder toward a given vocabulary.
+# Most useful for code-switched LT+English ("workshop", "skills", "API" etc.) so the
+# model preserves English tech terms instead of phonetically rendering them back as
+# Lithuanian-looking tokens.
+INITIAL_PROMPT = None
+
+# Optional post-transcription cleanup via Claude Code session (no API key required).
+# When enabled, each transcribed segment passes through `claude -p` for typo/morphology
+# correction before being written to the markdown output. Falls back silently to raw
+# whisper output on any error so recording is never broken by cleanup failure.
+ENHANCE = False
+ENHANCE_MODEL = "sonnet"
+CLAUDE_BIN = shutil.which("claude")
+
+LT_CLEANUP_SYSTEM_PROMPT = (
+    "You clean Lithuanian Whisper ASR transcripts. The input is a short utterance "
+    "(typically 5-30 seconds of speech) with phonetic transcription errors and often "
+    "English tech terms phonetically rendered into Lithuanian.\n\n"
+    "Fix these issues:\n"
+    "- Phonetic mangling (e.g. 'delikas' -> 'dalykas', 'vorkšapa' -> 'workshop')\n"
+    "- Wrong morphology (case endings, declensions)\n"
+    "- Missing word boundaries\n"
+    "- Restore English tech terms to their proper English spelling\n\n"
+    "Strict rules:\n"
+    "- Output ONLY the cleaned transcript text — no preamble, no explanation, no quotes\n"
+    "- Preserve speaker intent exactly — NEVER paraphrase or summarize\n"
+    "- Don't add punctuation beyond what's clearly justified by source\n"
+    "- Mark unrecoverable garbled sections as [unclear]\n"
+    "- If input is empty or pure noise, return [unclear]"
+)
+
+
+def _llm_cleanup(text, prev_text=""):
+    """Post-process a Whisper segment via `claude -p` (current Claude Code session auth).
+
+    Uses --system-prompt to replace the default Claude Code system prompt (skips the
+    ~46K-token skill-loading overhead per call, dropping per-chunk latency to ~3-5s).
+    Returns raw text on any error so the recording loop is never broken by a cleanup
+    failure (missing CLI, timeout, network error, malformed response).
+    """
+    if not CLAUDE_BIN or not text or not text.strip():
+        return text
+    user_msg = (f"Previous context: {prev_text}\n\n" if prev_text else "") + f"Clean: {text}"
+    try:
+        proc = subprocess.run(
+            [CLAUDE_BIN, "-p", "--output-format", "json",
+             "--system-prompt", LT_CLEANUP_SYSTEM_PROMPT,
+             "--model", ENHANCE_MODEL, user_msg],
+            capture_output=True, text=True, timeout=45, check=False,
+        )
+        if proc.returncode != 0:
+            return text
+        envelope = json.loads(proc.stdout)
+        if envelope.get("is_error"):
+            return text
+        cleaned = (envelope.get("result") or "").strip()
+        return cleaned or text
+    except Exception:
+        return text
 
 
 def log(msg):
@@ -264,6 +325,8 @@ def transcribe_timestamped(audio_path):
     cmd = [str(whisper_bin), "-m", str(active_model_path), "-f", str(audio_path)]
     if active_language_flag:
         cmd += ["-l", active_language_flag]
+    if INITIAL_PROMPT:
+        cmd += ["--prompt", INITIAL_PROMPT]
     r = subprocess.run(
         cmd,
         capture_output=True,
@@ -293,6 +356,8 @@ def transcribe_plain(audio_path):
     cmd = [str(whisper_bin), "-m", str(active_model_path), "-f", str(audio_path), "-nt"]
     if active_language_flag:
         cmd += ["-l", active_language_flag]
+    if INITIAL_PROMPT:
+        cmd += ["--prompt", INITIAL_PROMPT]
     r = subprocess.run(
         cmd,
         capture_output=True,
@@ -378,6 +443,17 @@ def process_dual_chunk(mic_wav, sys_wav, md_path, chunk_start):
             log("(no speech detected)")
             return
 
+        # Optional LLM cleanup pass — runs in this chunk's worker thread so it
+        # parallelizes naturally with the *next* chunk's whisper invocation.
+        if ENHANCE:
+            cleaned = []
+            prev = ""
+            for offset, speaker, text in merged:
+                clean = _llm_cleanup(text, prev)
+                cleaned.append((offset, speaker, clean))
+                prev = clean
+            merged = cleaned
+
         lines = []
         for offset, speaker, text in merged:
             abs_time = chunk_start + datetime.timedelta(seconds=offset)
@@ -411,6 +487,9 @@ def process_single_chunk(mic_wav, md_path, chunk_start):
         if not text:
             log("(no speech detected)")
             return
+
+        if ENHANCE:
+            text = _llm_cleanup(text)
 
         ts = chunk_start.strftime("%H:%M:%S")
         with file_lock:
@@ -566,8 +645,12 @@ Examples:
         help="Record microphone only (skip system audio capture)",
     )
     p.add_argument(
-        "--chunk", type=int, default=DEFAULT_CHUNK, metavar="SEC",
-        help=f"Chunk duration in seconds (default: {DEFAULT_CHUNK})",
+        "--chunk", type=int, default=None, metavar="SEC",
+        help=(
+            f"Chunk duration in seconds. Default: {DEFAULT_CHUNK}s for English, "
+            "20s for non-English languages (Whisper was trained on 30s windows, so "
+            "10s chunks fragment mid-word on inflectional languages like Lithuanian)."
+        ),
     )
     default_lang = os.environ.get("TRANSCRIBE_MD_LANGUAGE", "en")
     p.add_argument(
@@ -586,11 +669,54 @@ Examples:
             "Or provide an absolute path to a custom .bin file."
         ),
     )
+    p.add_argument(
+        "--prompt", default=None, metavar="TEXT",
+        help=(
+            "Initial-prompt vocabulary hint passed to whisper. Most useful for "
+            "code-switched LT+English speech (e.g. --prompt 'workshop design API "
+            "frontend backend prototype') — biases the decoder to preserve English "
+            "tech terms instead of phonetically rendering them as Lithuanian."
+        ),
+    )
+    p.add_argument(
+        "--enhance", action="store_true",
+        help=(
+            "Post-process each transcribed segment through `claude -p` (your current "
+            "Claude Code session — no separate API key needed) to correct phonetic "
+            "errors, fix morphology, and restore code-switched English tech terms. "
+            "Adds ~3-5s per chunk but runs in parallel with the next chunk's whisper, "
+            "so real-time feel is preserved. Falls back to raw whisper output on any "
+            "cleanup failure."
+        ),
+    )
+    p.add_argument(
+        "--enhance-model", default="sonnet", metavar="ALIAS",
+        help=(
+            "Model alias for --enhance cleanup (default: sonnet). Passed to "
+            "`claude --model`. Examples: sonnet, opus, haiku."
+        ),
+    )
 
     args = p.parse_args()
 
+    # ── Resolve enhancement + prompt options ──────────────────────────
+    global ENHANCE, ENHANCE_MODEL, INITIAL_PROMPT
+    ENHANCE = bool(args.enhance)
+    ENHANCE_MODEL = args.enhance_model or "sonnet"
+    INITIAL_PROMPT = args.prompt
+    if ENHANCE and not CLAUDE_BIN:
+        log("Warning: --enhance requested but `claude` CLI not on PATH; cleanup will be skipped per chunk.")
+
     # ── Resolve language and model ─────────────────────────────────────
     language = (args.language or "en").lower()
+
+    # Non-English defaults: bump chunk size from 10s -> 20s. Whisper was trained on
+    # 30s windows, so 10s chunks cause mid-word splices on inflectional languages.
+    if args.chunk is None:
+        chunk_duration = DEFAULT_CHUNK if language == "en" else 20
+    else:
+        chunk_duration = args.chunk
+    args.chunk = chunk_duration
 
     if args.model and Path(args.model).exists():
         # User provided a path to a local .bin (e.g., GGML fine-tuned model)
