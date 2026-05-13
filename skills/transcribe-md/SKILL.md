@@ -58,7 +58,14 @@ Ask the user:
 - Mic echoes of system audio are automatically deduplicated
 - Output: `**[HH:MM:SS] You:** text` and `**[HH:MM:SS] Them:** text`
 - Non-English transcripts include the language code in the header: `## Transcript [LT] -- ...`
-- **By default**, each chunk's whisper output is passed through `claude -p` for cleanup (typos, morphology, English code-switch restoration) before being written to markdown. The cleanup is language-aware (prompt parameterized by `--language`), uses your active Claude Code session auth (no separate API key), runs in parallel with the next chunk's whisper, and falls back silently to raw whisper text on any failure. Disable with `--no-enhance`.
+- **By default**, each chunk's whisper output is passed through `claude -p` for a professional-style cleanup pass before being written to markdown. The cleanup is language-aware (prompt parameterized by `--language`) and produces transcripts with:
+  - Proper punctuation and capitalization
+  - Fixed morphology and code-switching (English tech terms restored to proper spelling)
+  - Light filler-word removal (`uh`, `um`) and stutter collapse — intelligent verbatim
+  - `[unclear]` markers on unrecoverable garbled sections
+  - Strict no-paraphrase: speaker meaning preserved exactly
+  
+  Uses your active Claude Code session auth (no separate API key), runs in parallel with the next chunk's whisper, and falls back silently to raw whisper text on any failure. Disable with `--no-enhance`.
 
 ### Multilingual Support
 

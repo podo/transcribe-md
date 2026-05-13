@@ -92,17 +92,35 @@ Or run the script directly:
 
 ## Transcript cleanup
 
-**Enabled by default for all languages.** Each transcribed segment passes through your active Claude Code session (`claude -p` — no separate API key required) for a strict cleanup pass before being written to markdown. The cleanup is **language-aware** (the prompt template is parameterized by `--language`) and is most impactful on low-resource inflectional languages.
+**Enabled by default for all languages.** Each transcribed segment passes through your active Claude Code session (`claude -p` — no separate API key required) for a professional-style cleanup pass before being written to markdown. The cleanup is **language-aware** (the prompt template is parameterized by `--language`) and produces the kind of polished transcript a professional transcription service would deliver.
 
 The cleanup model is instructed to:
 
+**Grammar & accuracy:**
 - Fix phonetic mangling and incorrect word boundaries
 - Correct morphology (case endings, declensions, agreement)
 - Restore code-switched English tech terms to their proper English spelling
-- Mark unrecoverable garbled sections as `[unclear]`
-- **Never** paraphrase, summarize, or invent content
 
-Why it matters: even `large-v3-turbo` produces transcripts with ~28% word error rate on clean Lithuanian and ~30-40% on conversational/code-switched audio. Many of those errors are 1-2 character morphology slips ("priežas" instead of "priežastys") that an LT-capable LLM can recover cheaply. English transcripts mostly pass through unchanged since `base.en` is already accurate — the strict-no-paraphrase prompt makes worst case a no-op.
+**Sentence-level polish:**
+- Add proper punctuation (periods, question marks, commas at clause boundaries)
+- Capitalize sentence starts and proper nouns
+- Leave open-ended utterances open (next chunk continues the sentence)
+
+**Light disfluency cleanup (intelligent verbatim):**
+- Remove pure filler tokens (`uh`, `um`, `ee`, `mmm`)
+- Collapse obvious stutters (`the the cat` → `the cat`)
+- Keep meaningful repetitions and emphasis as-is
+
+**Strict boundaries:**
+- **Never** paraphrase, summarize, or invent content
+- Mark unrecoverable garbled sections as `[unclear]`
+
+Why it matters: even `large-v3-turbo` produces transcripts with ~28% word error rate on clean Lithuanian and ~30-40% on conversational/code-switched audio. Many of those errors are 1-2 character morphology slips ("priežas" instead of "priežastys") that an LT-capable LLM can recover cheaply. English transcripts mostly pass through unchanged since `base.en` is already accurate; the strict-no-paraphrase prompt makes worst case a no-op.
+
+**Empirical impact** (Sonnet 4.6 cleanup, head-to-head LLM-judge over 28 clips):
+- Raw Whisper output: preferred in **0/28** clips, avg score 1.96 / 5
+- With cleanup: preferred in **28/28** clips, avg score 4.07 / 5
+- On FLEURS-lt with human references: cleanup reduces pooled WER from 28.2% → 17.2% (**−39% relative**)
 
 ```bash
 # Default — cleanup on:
