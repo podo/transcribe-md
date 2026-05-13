@@ -80,11 +80,71 @@ Or run the script directly:
 | `--duration <MIN>`    | Auto-stop after N minutes                                      |
 | `--mic-only`          | Skip system audio capture                                      |
 | `--mic <IDX>`         | Use a specific microphone by device index                      |
-| `--chunk <SEC>`       | Chunk duration in seconds (default: 10)                        |
+| `--chunk <SEC>`       | Chunk duration. Default: 10s for English, 20s for non-English (Whisper trains on 30s windows, so 10s causes mid-word splices in inflectional languages) |
 | `--language <CODE>`   | Spoken language code (default: `en`). See [Languages](#languages) |
 | `--model <NAME\|PATH>` | Override model: `base.en`, `large-v3-turbo-q5`, or a `.bin` path |
+| `--prompt <TEXT>`     | Initial-prompt vocabulary hint passed to whisper. Useful for code-switched speech (e.g. `--prompt 'workshop design API frontend backend'`) |
+| `--no-enhance`        | Disable the default LLM cleanup pass (see [Transcript cleanup](#transcript-cleanup)) |
+| `--enhance-model <ALIAS>` | Model alias for cleanup (default: `sonnet`)                |
+| `--enhance-system-prompt <TEXT>` | Replace the default cleanup system prompt entirely (for domain-specific cleanup) |
 | `--devices`           | List available microphone devices                              |
 | `--setup`             | Install/verify dependencies without recording                  |
+
+## Transcript cleanup
+
+**Enabled by default for all languages.** Each transcribed segment passes through your active Claude Code session (`claude -p` — no separate API key required) for a professional-style cleanup pass before being written to markdown. The cleanup is **language-aware** (the prompt template is parameterized by `--language`) and produces the kind of polished transcript a professional transcription service would deliver.
+
+The cleanup model is instructed to:
+
+**Grammar & accuracy:**
+- Fix phonetic mangling and incorrect word boundaries
+- Correct morphology (case endings, declensions, agreement)
+- Restore code-switched English tech terms to their proper English spelling
+
+**Sentence-level polish:**
+- Add proper punctuation (periods, question marks, commas at clause boundaries)
+- Capitalize sentence starts and proper nouns
+- Leave open-ended utterances open (next chunk continues the sentence)
+
+**Light disfluency cleanup (intelligent verbatim):**
+- Remove pure filler tokens (`uh`, `um`, `ee`, `mmm`)
+- Collapse obvious stutters (`the the cat` → `the cat`)
+- Keep meaningful repetitions and emphasis as-is
+
+**Strict boundaries:**
+- **Never** paraphrase, summarize, or invent content
+- Mark unrecoverable garbled sections as `[unclear]`
+
+Why it matters: even `large-v3-turbo` produces transcripts with ~28% word error rate on clean Lithuanian and ~30-40% on conversational/code-switched audio. Many of those errors are 1-2 character morphology slips ("priežas" instead of "priežastys") that an LT-capable LLM can recover cheaply. English transcripts mostly pass through unchanged since `base.en` is already accurate; the strict-no-paraphrase prompt makes worst case a no-op.
+
+**Empirical impact** (Sonnet 4.6 cleanup, head-to-head LLM-judge over 28 clips):
+- Raw Whisper output: preferred in **0/28** clips, avg score 1.96 / 5
+- With cleanup: preferred in **28/28** clips, avg score 4.07 / 5
+- On FLEURS-lt with human references: cleanup reduces pooled WER from 28.2% → 17.2% (**−39% relative**)
+
+```bash
+# Default — cleanup on:
+/transcribe-md --language lt susitikimas.md
+/transcribe-md meeting.md                                # English, still cleaned
+
+# Disable cleanup (faster, no `claude` CLI required):
+/transcribe-md --no-enhance notes.md
+
+# Customize cleanup:
+/transcribe-md --enhance-model haiku notes.md            # cheaper/faster model
+/transcribe-md --enhance-model opus  notes.md            # higher-quality model
+/transcribe-md --enhance-system-prompt \
+   "You clean transcripts of cardiology consultations. Preserve drug names, dosages, and ICD codes exactly." \
+   patient-visit.md                                      # domain-specific cleanup
+```
+
+**Cost & latency:**
+
+- Uses your current Claude Code session auth — **no separate API key needed**.
+- Adds ~3-5 sec per chunk, but cleanup runs *in parallel* with the next chunk's whisper, so end-to-end real-time experience is preserved.
+- Approximate cost (when routed to a metered Claude tier): ~$0.02 per hour of recording. Effectively free when routed via a flat-rate Claude Code subscription.
+- **Any cleanup failure (CLI missing, timeout, network error) silently falls back to the raw whisper output**, so the recording is never broken by enhancement.
+- If `claude` is not on PATH when you run transcribe-md, you'll see a one-line notice at start and recording proceeds with raw output. Pass `--no-enhance` to silence the notice.
 
 ## Languages
 

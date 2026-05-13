@@ -21,10 +21,14 @@ Record and transcribe audio to a timestamped markdown file using whisper.cpp wit
 - `--mic-only` — Skip system audio capture (mic only)
 - `--devices` — List available microphone devices
 - `--mic <IDX>` — Use a specific microphone by device index
-- `--chunk <SEC>` — Chunk duration in seconds (default: 10)
+- `--chunk <SEC>` — Chunk duration in seconds (default: 10s for English, 20s for non-English — Whisper was trained on 30s windows, so 10s causes mid-word splices on inflectional languages)
 - `--setup` — Install/verify dependencies without recording
 - `--language <CODE>` — Spoken language code (default: `en`, or `$TRANSCRIBE_MD_LANGUAGE` env var). Use `lt` for Lithuanian, `auto` to auto-detect. Non-English automatically uses the multilingual model (~500 MB, pre-downloaded by installer).
 - `--model <NAME|PATH>` — Override model: `base.en` (~150 MB, English only), `large-v3-turbo-q5` (~500 MB, multilingual), or absolute path to a custom `.bin` file.
+- `--prompt <TEXT>` — Initial-prompt vocabulary hint for whisper. Useful for code-switched speech, e.g. `--prompt 'workshop design API frontend backend'` to preserve English tech terms.
+- `--no-enhance` — Disable the default LLM cleanup pass (faster, no `claude` CLI required). By default each transcribed segment runs through `claude -p` (your active Claude Code session, no separate API key) for typo/morphology correction and English-term restoration. Cleanup is language-aware and runs in parallel with the next chunk's whisper.
+- `--enhance-model <ALIAS>` — Model alias for cleanup (default: `sonnet`). Examples: `sonnet`, `opus`, `haiku`.
+- `--enhance-system-prompt <TEXT>` — Replace the default cleanup prompt entirely (for domain-specific cleanup like medical or legal jargon).
 
 ### Examples
 
@@ -32,9 +36,12 @@ Record and transcribe audio to a timestamped markdown file using whisper.cpp wit
 - `/transcribe-md notes.md` — Record until Ctrl-C
 - `/transcribe-md --mic-only dictation.md` — Mic only, no system audio
 - `/transcribe-md --devices` — List available microphones
-- `/transcribe-md --language lt susitikimas.md` — Record Lithuanian meeting
+- `/transcribe-md --language lt susitikimas.md` — Record Lithuanian meeting (cleanup on by default)
 - `/transcribe-md --language lt --duration 30 meeting.md` — Lithuanian, 30-minute limit
 - `/transcribe-md --language auto notes.md` — Auto-detect spoken language
+- `/transcribe-md --no-enhance notes.md` — Skip cleanup pass (faster, raw whisper output)
+- `/transcribe-md --language lt --prompt 'workshop design API' meeting.md` — Tech-meeting vocabulary hint
+- `/transcribe-md --enhance-model haiku notes.md` — Use cheaper Haiku model for cleanup
 
 ### When invoked without arguments
 
@@ -51,6 +58,14 @@ Ask the user:
 - Mic echoes of system audio are automatically deduplicated
 - Output: `**[HH:MM:SS] You:** text` and `**[HH:MM:SS] Them:** text`
 - Non-English transcripts include the language code in the header: `## Transcript [LT] -- ...`
+- **By default**, each chunk's whisper output is passed through `claude -p` for a professional-style cleanup pass before being written to markdown. The cleanup is language-aware (prompt parameterized by `--language`) and produces transcripts with:
+  - Proper punctuation and capitalization
+  - Fixed morphology and code-switching (English tech terms restored to proper spelling)
+  - Light filler-word removal (`uh`, `um`) and stutter collapse — intelligent verbatim
+  - `[unclear]` markers on unrecoverable garbled sections
+  - Strict no-paraphrase: speaker meaning preserved exactly
+  
+  Uses your active Claude Code session auth (no separate API key), runs in parallel with the next chunk's whisper, and falls back silently to raw whisper text on any failure. Disable with `--no-enhance`.
 
 ### Multilingual Support
 
