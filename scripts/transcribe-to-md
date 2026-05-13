@@ -78,52 +78,77 @@ pending_threads = []
 file_lock = threading.Lock()
 
 # Optional whisper initial prompt: biases the decoder toward a given vocabulary.
-# Most useful for code-switched LT+English ("workshop", "skills", "API" etc.) so the
-# model preserves English tech terms instead of phonetically rendering them back as
-# Lithuanian-looking tokens.
+# Most useful for code-switched non-English+English ("workshop", "skills", "API" etc.)
+# so the model preserves English tech terms instead of phonetically rendering them as
+# the spoken language.
 INITIAL_PROMPT = None
 
-# Optional post-transcription cleanup via Claude Code session (no API key required).
-# When enabled, each transcribed segment passes through `claude -p` for typo/morphology
-# correction before being written to the markdown output. Falls back silently to raw
-# whisper output on any error so recording is never broken by cleanup failure.
-ENHANCE = False
+# Post-transcription cleanup via Claude Code session (no API key required).
+# ENABLED BY DEFAULT — each transcribed segment passes through `claude -p` for typo,
+# morphology, and code-switch correction before being written to markdown. Disable
+# with --no-enhance. Falls back silently to raw whisper output on any error so the
+# recording loop is never broken by cleanup failure (missing CLI, timeout, etc.).
+ENHANCE = True
 ENHANCE_MODEL = "sonnet"
+ENHANCE_SYSTEM_PROMPT = None  # set to non-None to override the language-aware template
 CLAUDE_BIN = shutil.which("claude")
 
-LT_CLEANUP_SYSTEM_PROMPT = (
-    "You clean Lithuanian Whisper ASR transcripts. The input is a short utterance "
+# Minimal ISO-639-1 → human name map for the cleanup prompt. Unmapped codes fall back
+# to the code itself (the LLM can usually infer the language anyway).
+LANGUAGE_NAMES = {
+    "en": "English",       "lt": "Lithuanian",   "lv": "Latvian",     "et": "Estonian",
+    "de": "German",        "fr": "French",       "es": "Spanish",     "it": "Italian",
+    "pt": "Portuguese",    "nl": "Dutch",        "pl": "Polish",      "cs": "Czech",
+    "sk": "Slovak",        "hu": "Hungarian",    "ro": "Romanian",    "bg": "Bulgarian",
+    "ru": "Russian",       "uk": "Ukrainian",    "el": "Greek",       "tr": "Turkish",
+    "ja": "Japanese",      "zh": "Chinese",      "ko": "Korean",      "ar": "Arabic",
+    "hi": "Hindi",         "he": "Hebrew",       "fi": "Finnish",     "sv": "Swedish",
+    "no": "Norwegian",     "da": "Danish",       "auto": "the spoken",
+}
+
+CLEANUP_SYSTEM_PROMPT_TEMPLATE = (
+    "You clean {language_name} Whisper ASR transcripts. The input is a short utterance "
     "(typically 5-30 seconds of speech) with phonetic transcription errors and often "
-    "English tech terms phonetically rendered into Lithuanian.\n\n"
+    "code-switched English tech terms phonetically rendered into {language_name}.\n\n"
     "Fix these issues:\n"
-    "- Phonetic mangling (e.g. 'delikas' -> 'dalykas', 'vorkšapa' -> 'workshop')\n"
-    "- Wrong morphology (case endings, declensions)\n"
-    "- Missing word boundaries\n"
-    "- Restore English tech terms to their proper English spelling\n\n"
+    "- Phonetic mangling and incorrect word boundaries\n"
+    "- Wrong morphology (case endings, declensions, agreement)\n"
+    "- Restore code-switched English tech terms to their proper English spelling\n\n"
     "Strict rules:\n"
     "- Output ONLY the cleaned transcript text — no preamble, no explanation, no quotes\n"
-    "- Preserve speaker intent exactly — NEVER paraphrase or summarize\n"
+    "- Preserve speaker intent exactly — NEVER paraphrase, summarize, or invent content\n"
     "- Don't add punctuation beyond what's clearly justified by source\n"
     "- Mark unrecoverable garbled sections as [unclear]\n"
     "- If input is empty or pure noise, return [unclear]"
 )
 
 
-def _llm_cleanup(text, prev_text=""):
+def _language_name(code):
+    return LANGUAGE_NAMES.get((code or "").lower(), code or "the spoken")
+
+
+def _llm_cleanup(text, prev_text="", language="en"):
     """Post-process a Whisper segment via `claude -p` (current Claude Code session auth).
 
-    Uses --system-prompt to replace the default Claude Code system prompt (skips the
-    ~46K-token skill-loading overhead per call, dropping per-chunk latency to ~3-5s).
+    The cleanup prompt is built from CLEANUP_SYSTEM_PROMPT_TEMPLATE with the active
+    language substituted in (or ENHANCE_SYSTEM_PROMPT if the user provided a custom
+    override via --enhance-system-prompt). Uses --system-prompt to replace the default
+    Claude Code system prompt (skips the ~46K-token skill-loading overhead per call,
+    dropping per-chunk latency to ~3-5s).
+
     Returns raw text on any error so the recording loop is never broken by a cleanup
     failure (missing CLI, timeout, network error, malformed response).
     """
     if not CLAUDE_BIN or not text or not text.strip():
         return text
+    system_prompt = ENHANCE_SYSTEM_PROMPT or CLEANUP_SYSTEM_PROMPT_TEMPLATE.format(
+        language_name=_language_name(language)
+    )
     user_msg = (f"Previous context: {prev_text}\n\n" if prev_text else "") + f"Clean: {text}"
     try:
         proc = subprocess.run(
             [CLAUDE_BIN, "-p", "--output-format", "json",
-             "--system-prompt", LT_CLEANUP_SYSTEM_PROMPT,
+             "--system-prompt", system_prompt,
              "--model", ENHANCE_MODEL, user_msg],
             capture_output=True, text=True, timeout=45, check=False,
         )
@@ -443,13 +468,15 @@ def process_dual_chunk(mic_wav, sys_wav, md_path, chunk_start):
             log("(no speech detected)")
             return
 
-        # Optional LLM cleanup pass — runs in this chunk's worker thread so it
+        # Default LLM cleanup pass — runs in this chunk's worker thread so it
         # parallelizes naturally with the *next* chunk's whisper invocation.
+        # Disabled by --no-enhance or when `claude` CLI is missing.
         if ENHANCE:
+            lang = active_language_flag or "en"
             cleaned = []
             prev = ""
             for offset, speaker, text in merged:
-                clean = _llm_cleanup(text, prev)
+                clean = _llm_cleanup(text, prev, language=lang)
                 cleaned.append((offset, speaker, clean))
                 prev = clean
             merged = cleaned
@@ -489,7 +516,7 @@ def process_single_chunk(mic_wav, md_path, chunk_start):
             return
 
         if ENHANCE:
-            text = _llm_cleanup(text)
+            text = _llm_cleanup(text, language=(active_language_flag or "en"))
 
         ts = chunk_start.strftime("%H:%M:%S")
         with file_lock:
@@ -673,39 +700,50 @@ Examples:
         "--prompt", default=None, metavar="TEXT",
         help=(
             "Initial-prompt vocabulary hint passed to whisper. Most useful for "
-            "code-switched LT+English speech (e.g. --prompt 'workshop design API "
-            "frontend backend prototype') — biases the decoder to preserve English "
-            "tech terms instead of phonetically rendering them as Lithuanian."
+            "code-switched speech (e.g. --prompt 'workshop design API frontend "
+            "backend prototype') — biases the decoder to preserve English tech "
+            "terms instead of phonetically rendering them in the spoken language."
         ),
     )
     p.add_argument(
-        "--enhance", action="store_true",
+        "--no-enhance", action="store_true",
         help=(
-            "Post-process each transcribed segment through `claude -p` (your current "
-            "Claude Code session — no separate API key needed) to correct phonetic "
-            "errors, fix morphology, and restore code-switched English tech terms. "
-            "Adds ~3-5s per chunk but runs in parallel with the next chunk's whisper, "
-            "so real-time feel is preserved. Falls back to raw whisper output on any "
-            "cleanup failure."
+            "Disable the default LLM cleanup pass. Faster, no `claude` CLI required, "
+            "slightly more raw output. By default each transcribed segment runs "
+            "through `claude -p` (your current Claude Code session — no separate API "
+            "key needed) to correct phonetic errors, fix morphology, and restore "
+            "code-switched English tech terms. Cleanup runs in parallel with the next "
+            "chunk's whisper, so real-time feel is preserved, and falls back silently "
+            "to raw whisper output on any cleanup failure."
         ),
     )
     p.add_argument(
         "--enhance-model", default="sonnet", metavar="ALIAS",
         help=(
-            "Model alias for --enhance cleanup (default: sonnet). Passed to "
-            "`claude --model`. Examples: sonnet, opus, haiku."
+            "Model alias for cleanup (default: sonnet). Passed to `claude --model`. "
+            "Examples: sonnet, opus, haiku."
+        ),
+    )
+    p.add_argument(
+        "--enhance-system-prompt", default=None, metavar="TEXT",
+        help=(
+            "Replace the default cleanup system prompt entirely. For domain-specific "
+            "cleanup (medical jargon, legal terms, etc.) when the generic multilingual "
+            "template isn't what you want."
         ),
     )
 
     args = p.parse_args()
 
     # ── Resolve enhancement + prompt options ──────────────────────────
-    global ENHANCE, ENHANCE_MODEL, INITIAL_PROMPT
-    ENHANCE = bool(args.enhance)
+    global ENHANCE, ENHANCE_MODEL, ENHANCE_SYSTEM_PROMPT, INITIAL_PROMPT
+    ENHANCE = not args.no_enhance and CLAUDE_BIN is not None
     ENHANCE_MODEL = args.enhance_model or "sonnet"
+    ENHANCE_SYSTEM_PROMPT = args.enhance_system_prompt
     INITIAL_PROMPT = args.prompt
-    if ENHANCE and not CLAUDE_BIN:
-        log("Warning: --enhance requested but `claude` CLI not on PATH; cleanup will be skipped per chunk.")
+    if not args.no_enhance and not CLAUDE_BIN:
+        log("Note: `claude` CLI not on PATH — recording proceeds without LLM cleanup. "
+            "Install Claude Code or pass --no-enhance to silence this notice.")
 
     # ── Resolve language and model ─────────────────────────────────────
     language = (args.language or "en").lower()

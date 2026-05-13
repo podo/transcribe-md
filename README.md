@@ -83,39 +83,50 @@ Or run the script directly:
 | `--chunk <SEC>`       | Chunk duration. Default: 10s for English, 20s for non-English (Whisper trains on 30s windows, so 10s causes mid-word splices in inflectional languages) |
 | `--language <CODE>`   | Spoken language code (default: `en`). See [Languages](#languages) |
 | `--model <NAME\|PATH>` | Override model: `base.en`, `large-v3-turbo-q5`, or a `.bin` path |
-| `--prompt <TEXT>`     | Initial-prompt vocabulary hint passed to whisper. Useful for code-switched LT+English speech (e.g. `--prompt 'workshop design API frontend backend'`) |
-| `--enhance`           | Post-process each transcribed segment via `claude -p` for typo/morphology correction and English-term restoration. See [Enhanced transcription](#enhanced-transcription) |
-| `--enhance-model <ALIAS>` | Model alias for `--enhance` (default: `sonnet`)            |
+| `--prompt <TEXT>`     | Initial-prompt vocabulary hint passed to whisper. Useful for code-switched speech (e.g. `--prompt 'workshop design API frontend backend'`) |
+| `--no-enhance`        | Disable the default LLM cleanup pass (see [Transcript cleanup](#transcript-cleanup)) |
+| `--enhance-model <ALIAS>` | Model alias for cleanup (default: `sonnet`)                |
+| `--enhance-system-prompt <TEXT>` | Replace the default cleanup system prompt entirely (for domain-specific cleanup) |
 | `--devices`           | List available microphone devices                              |
 | `--setup`             | Install/verify dependencies without recording                  |
 
-## Enhanced transcription
+## Transcript cleanup
 
-For low-resource languages like Lithuanian, even `large-v3-turbo` produces transcripts with ~28% word error rate on clean speech and ~30-40% on conversational/code-switched audio. Common errors: morphology slips ("priežas" instead of "priežastys"), missing word boundaries, phonetic mangling of English tech terms ("vorkšapa" instead of "workshop").
+**Enabled by default for all languages.** Each transcribed segment passes through your active Claude Code session (`claude -p` — no separate API key required) for a strict cleanup pass before being written to markdown. The cleanup is **language-aware** (the prompt template is parameterized by `--language`) and is most impactful on low-resource inflectional languages.
 
-The `--enhance` flag runs each transcribed segment through your active Claude Code session (`claude -p`) for a cleanup pass before writing to markdown. The cleanup model is prompted to:
+The cleanup model is instructed to:
 
-- Fix phonetic mangling and morphology
-- Restore English tech terms to their proper spelling
+- Fix phonetic mangling and incorrect word boundaries
+- Correct morphology (case endings, declensions, agreement)
+- Restore code-switched English tech terms to their proper English spelling
 - Mark unrecoverable garbled sections as `[unclear]`
 - **Never** paraphrase, summarize, or invent content
 
-```bash
-# Lithuanian meeting with LLM cleanup:
-/transcribe-md --language lt --enhance susitikimas.md
+Why it matters: even `large-v3-turbo` produces transcripts with ~28% word error rate on clean Lithuanian and ~30-40% on conversational/code-switched audio. Many of those errors are 1-2 character morphology slips ("priežas" instead of "priežastys") that an LT-capable LLM can recover cheaply. English transcripts mostly pass through unchanged since `base.en` is already accurate — the strict-no-paraphrase prompt makes worst case a no-op.
 
-# Add a vocabulary prompt to bias toward your typical tech terms:
-/transcribe-md --language lt --enhance \
-               --prompt 'workshop skills API frontend backend prototype' \
-               meeting.md
+```bash
+# Default — cleanup on:
+/transcribe-md --language lt susitikimas.md
+/transcribe-md meeting.md                                # English, still cleaned
+
+# Disable cleanup (faster, no `claude` CLI required):
+/transcribe-md --no-enhance notes.md
+
+# Customize cleanup:
+/transcribe-md --enhance-model haiku notes.md            # cheaper/faster model
+/transcribe-md --enhance-model opus  notes.md            # higher-quality model
+/transcribe-md --enhance-system-prompt \
+   "You clean transcripts of cardiology consultations. Preserve drug names, dosages, and ICD codes exactly." \
+   patient-visit.md                                      # domain-specific cleanup
 ```
 
 **Cost & latency:**
 
 - Uses your current Claude Code session auth — **no separate API key needed**.
-- Adds ~3-5 sec per chunk, but the cleanup runs *in parallel* with the next chunk's whisper, so end-to-end real-time experience is preserved.
+- Adds ~3-5 sec per chunk, but cleanup runs *in parallel* with the next chunk's whisper, so end-to-end real-time experience is preserved.
 - Approximate cost (when routed to a metered Claude tier): ~$0.02 per hour of recording. Effectively free when routed via a flat-rate Claude Code subscription.
 - **Any cleanup failure (CLI missing, timeout, network error) silently falls back to the raw whisper output**, so the recording is never broken by enhancement.
+- If `claude` is not on PATH when you run transcribe-md, you'll see a one-line notice at start and recording proceeds with raw output. Pass `--no-enhance` to silence the notice.
 
 ## Languages
 
