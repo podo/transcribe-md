@@ -99,10 +99,10 @@ Auto-installed on first run. whisper.cpp and models cached in `~/.cache/transcri
 
 ### Updating
 
-Re-run the installer to update the local install (`~/.local/share/transcribe-md`) to the latest version:
+Re-run the install command to update — it detects an existing install and updates it in place:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/podo/transcribe-md/main/install.sh | bash
 ```
 
-It fast-forwards the existing git checkout, or re-clones if it can't. If it reports "Already up to date" but features are missing (stale remote or local edits masking the update), force a clean reinstall: `rm -rf ~/.local/share/transcribe-md` then re-run the installer. Cached models in `~/.cache/transcribe-cli/` are preserved either way.
+Same command for install and update. A clean checkout is fast-forwarded; a different remote, diverged history, or local edits trigger a fresh re-clone (local changes are backed up to a timestamped directory first). Cached models and builds in `~/.cache/transcribe-cli/` are preserved. Add `--reclone` to force a clean re-clone.

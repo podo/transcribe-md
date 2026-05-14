@@ -41,14 +41,16 @@ from pathlib import Path
 # Resolve paths relative to this script so the skill is portable
 SCRIPT_DIR = Path(__file__).resolve().parent
 
-# Swift helper lives next to this script
-SWIFT_PROJECT = SCRIPT_DIR / "system-audio-tap"
-SYSTEM_TAP_BIN = SWIFT_PROJECT / ".build" / "release" / "system-audio-tap"
-
-# Large build artifacts (whisper.cpp, models) stay in ~/.cache
+# Large build artifacts (whisper.cpp, models, Swift build) stay in ~/.cache
+# so the install directory is a pure, disposable git checkout
 CACHE_DIR = Path.home() / ".cache" / "transcribe-cli"
 WHISPER_DIR = CACHE_DIR / "whisper.cpp"
 MODEL_DIR = CACHE_DIR / "models"
+SWIFT_BUILD_DIR = CACHE_DIR / "system-audio-tap-build"
+
+# Swift helper source lives next to this script; build output goes in the cache
+SWIFT_PROJECT = SCRIPT_DIR / "system-audio-tap"
+SYSTEM_TAP_BIN = SWIFT_BUILD_DIR / "release" / "system-audio-tap"
 DEFAULT_CHUNK = 10  # seconds
 
 HF_BASE = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main"
@@ -268,8 +270,9 @@ def ensure_system_audio_tap():
         log("system-audio-tap Swift project not found — skipping system audio")
         return
     log("Building system-audio-tap (Swift, ScreenCaptureKit)...")
+    SWIFT_BUILD_DIR.mkdir(parents=True, exist_ok=True)
     subprocess.run(
-        ["swift", "build", "-c", "release"],
+        ["swift", "build", "-c", "release", "--scratch-path", str(SWIFT_BUILD_DIR)],
         cwd=str(SWIFT_PROJECT),
         check=True,
     )

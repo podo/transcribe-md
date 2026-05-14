@@ -21,25 +21,61 @@ ok()    { printf '\033[1;32m  ✓\033[0m %s\n' "$*"; }
 warn()  { printf '\033[1;33m  !\033[0m %s\n' "$*"; }
 err()   { printf '\033[1;31mError:\033[0m %s\n' "$*" >&2; exit 1; }
 
+reclone() {
+  rm -rf "$INSTALL_DIR"
+  git clone --depth 1 "$REPO" "$INSTALL_DIR" --quiet
+}
+
 # ── Pre-flight ──────────────────────────────────────────────────────────────
 
 [[ "$(uname -s)" == "Darwin" ]] || err "transcribe-md requires macOS (uses AVFoundation, ScreenCaptureKit, Metal)"
 command -v git >/dev/null 2>&1 || err "git is required but not found"
 
+FORCE_RECLONE=false
+for arg in "$@"; do
+  case "$arg" in
+    --reclone) FORCE_RECLONE=true ;;
+    *) err "Unknown option: $arg (supported: --reclone)" ;;
+  esac
+done
+
 # ── Clone / update ──────────────────────────────────────────────────────────
+#
+# Re-running this installer always lands on the latest version. A clean,
+# correctly-tracked checkout is fast-forwarded in place; anything else — a
+# different remote, diverged history, or local edits — falls back to a fresh
+# re-clone. Local modifications are backed up before they are replaced.
 
 info "Installing transcribe-md"
 
-if [ -d "$INSTALL_DIR/.git" ]; then
-  info "Updating existing installation..."
-  git -C "$INSTALL_DIR" pull --ff-only --quiet 2>/dev/null || {
-    warn "Could not fast-forward; re-cloning..."
-    rm -rf "$INSTALL_DIR"
-    git clone --depth 1 "$REPO" "$INSTALL_DIR" --quiet
-  }
+if [ "$FORCE_RECLONE" = true ]; then
+  warn "Forcing a clean re-clone (--reclone)"
+  reclone
+elif [ -d "$INSTALL_DIR/.git" ]; then
+  current_remote="$(git -C "$INSTALL_DIR" remote get-url origin 2>/dev/null || true)"
+  if [ "$current_remote" != "$REPO" ]; then
+    warn "Existing install tracks a different remote — re-cloning"
+    reclone
+  elif [ -n "$(git -C "$INSTALL_DIR" status --porcelain)" ]; then
+    backup_dir="${TMPDIR:-/tmp}/transcribe-md-backup-$(date +%Y%m%d-%H%M%S)"
+    warn "Existing install has local changes — backing up to $backup_dir"
+    git -C "$INSTALL_DIR" status --porcelain | cut -c4- | while IFS= read -r f; do
+      mkdir -p "$backup_dir/$(dirname "$f")"
+      cp -R "$INSTALL_DIR/$f" "$backup_dir/$f" 2>/dev/null || true
+    done
+    reclone
+  else
+    info "Updating existing installation..."
+    if git -C "$INSTALL_DIR" fetch --quiet origin main \
+       && git -C "$INSTALL_DIR" checkout -q -B main origin/main; then
+      ok "Updated to $(git -C "$INSTALL_DIR" rev-parse --short HEAD)"
+    else
+      warn "Could not fast-forward — re-cloning"
+      reclone
+    fi
+  fi
 else
-  rm -rf "$INSTALL_DIR"
-  git clone --depth 1 "$REPO" "$INSTALL_DIR" --quiet
+  reclone
 fi
 
 chmod +x "$INSTALL_DIR/scripts/transcribe-to-md"
