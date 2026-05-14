@@ -53,6 +53,11 @@ SWIFT_PROJECT = SCRIPT_DIR / "system-audio-tap"
 SYSTEM_TAP_BIN = SWIFT_BUILD_DIR / "release" / "system-audio-tap"
 DEFAULT_CHUNK = 10  # seconds
 
+# Backpressure: max chunks allowed "in flight" (recorded but not yet written).
+# When processing falls this far behind, the recording loop blocks on the
+# oldest worker instead of spawning unbounded threads + `claude` subprocesses.
+MAX_PENDING_CHUNKS = 3
+
 HF_BASE = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main"
 
 # Model registry: name -> (filename, download_url, multilingual)
@@ -177,6 +182,66 @@ def _llm_cleanup(text, prev_text="", language="en"):
         return cleaned or text
     except Exception:
         return text
+
+
+def _llm_cleanup_batch(segments, language="en"):
+    """Clean a whole chunk's segments in ONE `claude -p` call.
+
+    `segments` is a list of (offset, speaker, text); returns the same list with
+    cleaned text. Batching is what keeps long recordings from drowning the
+    machine — one `claude` (Node) subprocess per chunk instead of one per
+    segment, which previously meant dozens of concurrent processes after ~30min.
+
+    Input lines are numbered so the response can be re-aligned 1:1. On ANY error
+    (missing CLI, timeout, malformed response, count mismatch) the raw segments
+    are returned unchanged, so cleanup failure never breaks the recording loop.
+    """
+    if not CLAUDE_BIN or not segments:
+        return segments
+    system_prompt = ENHANCE_SYSTEM_PROMPT or CLEANUP_SYSTEM_PROMPT_TEMPLATE.format(
+        language_name=_language_name(language)
+    )
+    numbered = "\n".join(f"{i + 1}. {text}" for i, (_o, _s, text) in enumerate(segments))
+    user_msg = (
+        "Clean each numbered utterance below. Return ONLY the cleaned lines with "
+        "the SAME numbering, one per line, in the same order. Do not merge, "
+        "split, drop, reorder, or renumber lines.\n\n" + numbered
+    )
+    try:
+        proc = subprocess.run(
+            [CLAUDE_BIN, "-p", "--output-format", "json",
+             "--system-prompt", system_prompt,
+             "--model", ENHANCE_MODEL, user_msg],
+            capture_output=True, text=True, timeout=90, check=False,
+        )
+        if proc.returncode != 0:
+            return segments
+        envelope = json.loads(proc.stdout)
+        if envelope.get("is_error"):
+            return segments
+        result = (envelope.get("result") or "").strip()
+        if not result:
+            return segments
+        # Parse "N. text" lines back into a number->text map. A line without a
+        # leading number is treated as a continuation of the previous segment.
+        cleaned_map = {}
+        current = None
+        for line in result.splitlines():
+            m = re.match(r"\s*(\d+)\.\s+(.*)", line)
+            if m:
+                current = int(m.group(1))
+                cleaned_map[current] = m.group(2).strip()
+            elif current is not None and line.strip():
+                cleaned_map[current] += " " + line.strip()
+        # Require a clean 1:1 mapping; anything else falls back to raw output.
+        if len(cleaned_map) != len(segments):
+            return segments
+        return [
+            (offset, speaker, cleaned_map.get(i + 1) or text)
+            for i, (offset, speaker, text) in enumerate(segments)
+        ]
+    except Exception:
+        return segments
 
 
 def log(msg):
@@ -487,16 +552,11 @@ def process_dual_chunk(mic_wav, sys_wav, md_path, chunk_start):
 
         # Default LLM cleanup pass — runs in this chunk's worker thread so it
         # parallelizes naturally with the *next* chunk's whisper invocation.
+        # The whole chunk is cleaned in a SINGLE `claude -p` call (see
+        # _llm_cleanup_batch) — one subprocess per chunk, not per segment.
         # Disabled by --no-enhance or when `claude` CLI is missing.
         if ENHANCE:
-            lang = active_language_flag or "en"
-            cleaned = []
-            prev = ""
-            for offset, speaker, text in merged:
-                clean = _llm_cleanup(text, prev, language=lang)
-                cleaned.append((offset, speaker, clean))
-                prev = clean
-            merged = cleaned
+            merged = _llm_cleanup_batch(merged, language=active_language_flag or "en")
 
         lines = []
         for offset, speaker, text in merged:
@@ -638,7 +698,20 @@ def run(md_path, mic_idx, dual, chunk_duration, duration_minutes=None):
             t.start()
             pending_threads.append(t)
 
+            # Backpressure. Drop finished workers, then — if processing has
+            # fallen behind — block on the oldest one before recording the next
+            # chunk. Without this the loop spawns a thread (and its `claude`
+            # subprocesses) every chunk regardless of whether the previous ones
+            # finished, which is what made the machine swap itself to death
+            # after ~30min of recording.
             pending_threads[:] = [t for t in pending_threads if t.is_alive()]
+            while len(pending_threads) >= MAX_PENDING_CHUNKS:
+                log(
+                    f"Transcription behind ({len(pending_threads)} chunks "
+                    "queued) — pausing recording until it catches up"
+                )
+                pending_threads[0].join()
+                pending_threads[:] = [t for t in pending_threads if t.is_alive()]
 
     finally:
         if pending_threads:
