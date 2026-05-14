@@ -96,3 +96,13 @@ python3 ~/.cache/transcribe-cli/whisper.cpp/models/convert-h5-to-ggml.py \
 ### Dependencies
 
 Auto-installed on first run. whisper.cpp and models cached in `~/.cache/transcribe-cli/`. System audio requires macOS 14+ and **Screen Recording** permission for the terminal.
+
+### Updating
+
+Re-run the installer to update the local install (`~/.local/share/transcribe-md`) to the latest version:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/podo/transcribe-md/main/install.sh | bash
+```
+
+It fast-forwards the existing git checkout, or re-clones if it can't. If it reports "Already up to date" but features are missing (stale remote or local edits masking the update), force a clean reinstall: `rm -rf ~/.local/share/transcribe-md` then re-run the installer. Cached models in `~/.cache/transcribe-cli/` are preserved either way.

@@ -5,9 +5,9 @@ set -euo pipefail
 # Installs the transcribe-md skill for Claude Code and Cursor.
 #
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/hrescak/transcribe-md/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/podo/transcribe-md/main/install.sh | bash
 
-REPO="https://github.com/hrescak/transcribe-md.git"
+REPO="https://github.com/podo/transcribe-md.git"
 INSTALL_DIR="$HOME/.local/share/transcribe-md"
 
 CLAUDE_COMMANDS_DIR="$HOME/.claude/commands"

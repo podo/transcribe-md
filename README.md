@@ -51,7 +51,35 @@ This installs transcribe-md and registers it as a skill in both **Claude Code** 
 3. Copies the skill definition into Cursor (`~/.cursor/skills-cursor/transcribe-md/`)
 4. Installs dependencies (ffmpeg, whisper.cpp, models, system-audio-tap)
 
-Re-running the installer updates to the latest version.
+## Updating
+
+One command updates and reinstalls the whole tool to the latest version — paste this and you're current:
+
+```bash
+rm -rf ~/.local/share/transcribe-md && curl -fsSL https://raw.githubusercontent.com/podo/transcribe-md/main/install.sh | bash
+```
+
+This wipes the install directory and re-clones a fresh copy, so it always lands on the latest version regardless of local edits or a stale remote. It only removes the small set of scripts — your cached whisper.cpp build and models in `~/.cache/transcribe-cli/` are left untouched, so it's fast and never re-downloads the models.
+
+### Lighter-weight update
+
+If you haven't hand-edited anything, you can just re-run the installer without the `rm -rf`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/podo/transcribe-md/main/install.sh | bash
+```
+
+When `~/.local/share/transcribe-md` is already a git checkout, the installer fast-forwards it with `git pull --ff-only`, falling back to a re-clone if it can't. The catch: if it reports "Already up to date" but you're still missing recent features — which happens when the local checkout tracks an older fork or has local modifications masking the update — use the single command above instead.
+
+### Checking your installed version
+
+```bash
+git -C ~/.local/share/transcribe-md log --oneline -1   # latest commit in your install
+git -C ~/.local/share/transcribe-md remote -v          # which fork it tracks
+git -C ~/.local/share/transcribe-md status -sb         # any local modifications?
+```
+
+> **Note:** if you've hand-edited `~/.local/share/transcribe-md/scripts/transcribe-to-md` directly, a re-clone will discard those changes. Commit them to a fork (or copy the file aside) before updating.
 
 ## Usage
 
